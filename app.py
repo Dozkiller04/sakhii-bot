@@ -246,4 +246,8 @@ if not os.path.exists(AVAILABILITY_FILE):
 print("Sakhii: DB initialized and availability ensured. Starting app...")
 
 if __name__ == '__main__':
+<<<<<<< HEAD
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+=======
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+>>>>>>> b8fb3a3 (Init DB at import and ensure availability file on startup)
