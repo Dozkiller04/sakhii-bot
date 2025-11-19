@@ -238,8 +238,12 @@ def send_summary_to_admin():
 def health():
     return "OK", 200
 
+# Ensure DB and availability file exist when the app starts (works under Gunicorn)
+init_db()
+if not os.path.exists(AVAILABILITY_FILE):
+    set_availability('available')
+
+print("Sakhii: DB initialized and availability ensured. Starting app...")
+
 if __name__ == '__main__':
-    init_db()
-    if not os.path.exists(AVAILABILITY_FILE):
-        set_availability('available')
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
