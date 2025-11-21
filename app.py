@@ -238,14 +238,21 @@ def voice_webhook():
 
 @app.route('/set_status', methods=['POST'])
 def set_status():
-    payload = request.get_json(silent=True) or {}
-    new_state = payload.get('state')
-    if new_state not in ('available','busy','sleeping'):
+    # Accept JSON or form-encoded bodies (PowerShell/curl friendliness)
+    payload = request.get_json(silent=True)
+    new_state = None
+    if payload and isinstance(payload, dict):
+        new_state = payload.get('state')
+    # Fallback to form data or query params
+    if not new_state:
+        new_state = request.form.get('state') or request.values.get('state')
+    if not new_state or new_state not in ('available','busy','sleeping'):
         return jsonify({'error':'invalid'}), 400
     set_availability(new_state)
     if new_state == 'available':
         send_summary_to_admin()
     return jsonify({'ok':True})
+
 
 def send_summary_to_admin():
     conn = sqlite3.connect(DB)
