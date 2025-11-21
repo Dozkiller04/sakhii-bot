@@ -1,4 +1,4 @@
-# app.py
+﻿# app.py (fixed and improved)
 import os
 import sqlite3
 from flask import Flask, request, jsonify
@@ -10,11 +10,21 @@ import re
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN  = os.getenv('TWILIO_AUTH_TOKEN')
 WHATSAPP_FROM      = os.getenv('WHATSAPP_FROM')  # e.g. 'whatsapp:+1415xxxxxxx'
-ADMIN_WHATSAPP     = os.getenv('ADMIN_WHATSAPP') # your number 'whatsapp:+91...'
+ADMIN_WHATSAPP     = os.getenv('ADMIN_WHATSAPP') # 'whatsapp:+91...'
 AVAILABILITY_FILE  = 'availability.txt'
 SAKHII_NAME = "Sakhii"
 
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+# create Twilio client lazily
+_twilio_client = None
+def get_twilio_client():
+    global _twilio_client
+    if _twilio_client is None:
+        if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
+            print("Warning: Twilio credentials are missing. Bot will not send WhatsApp messages.")
+            return None
+        _twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    return _twilio_client
+
 app = Flask(__name__)
 DB = 'whatsapp_bot.db'
 
@@ -30,6 +40,9 @@ def init_db():
     conn.commit()
     conn.close()
 
+def _now_sql():
+    return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
 def save_user_language(phone, lang, display_name=None):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
@@ -38,11 +51,13 @@ def save_user_language(phone, lang, display_name=None):
         cur.execute('UPDATE users SET preferred_lang=? WHERE phone=?', (lang, phone))
     else:
         cur.execute('INSERT INTO users (phone,display_name,preferred_lang,created_at) VALUES (?,?,?,?)',
-                    (phone, display_name or '', lang, datetime.utcnow().isoformat()))
+                    (phone, display_name or '', lang, _now_sql()))
     conn.commit()
     conn.close()
 
 def get_user_language(phone):
+    if not phone:
+        return None
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute('SELECT preferred_lang FROM users WHERE phone=?', (phone,))
@@ -54,7 +69,7 @@ def save_message(from_num, to_num, text, media, direction, urgent=0):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute('INSERT INTO messages (from_num,to_num,text,media,direction,ts,urgent) VALUES (?,?,?,?,?,?,?)',
-                (from_num,to_num,text,media,direction, datetime.utcnow().isoformat(), urgent))
+                (from_num or '', to_num or '', text or '', media or None, direction or '', _now_sql(), urgent))
     conn.commit()
     conn.close()
 
@@ -62,7 +77,7 @@ def save_task(phone, text):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute('INSERT INTO tasks (phone,text,created_at,status) VALUES (?,?,?,?)',
-                (phone, text, datetime.utcnow().isoformat(), 'open'))
+                (phone or '', text or '', _now_sql(), 'open'))
     conn.commit()
     conn.close()
 
@@ -140,6 +155,31 @@ def detect_task(text):
         return True
     return False
 
+def _normalize_whatsapp(num):
+    if not num:
+        return None
+    if num.startswith('whatsapp:'):
+        return num
+    num = num.strip()
+    if num.startswith('+'):
+        return f'whatsapp:{num}'
+    return f'whatsapp:{num}'
+
+def send_whatsapp(to, body):
+    to = _normalize_whatsapp(to)
+    from_ = WHATSAPP_FROM
+    if not to or not from_:
+        print("send_whatsapp: missing 'to' or WHATSAPP_FROM'")
+        return None
+    client = get_twilio_client()
+    if client is None:
+        return None
+    try:
+        return client.messages.create(body=body, from_=from_, to=to)
+    except Exception as e:
+        print("Twilio send error:", e)
+        return None
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     from_num = request.values.get('From')
@@ -148,8 +188,13 @@ def webhook():
     num_media = int(request.values.get('NumMedia', '0'))
     media_urls = []
     for i in range(num_media):
-        media_urls.append(request.values.get(f'MediaUrl{i}'))
+        m = request.values.get(f'MediaUrl{i}')
+        if m:
+            media_urls.append(m)
     media = ','.join(media_urls) if media_urls else None
+
+    if from_num and not from_num.startswith('whatsapp:'):
+        from_num = _normalize_whatsapp(from_num)
 
     lang = get_user_language(from_num)
     if not lang:
@@ -161,32 +206,19 @@ def webhook():
 
     state = get_availability()
     if state != 'available':
-        try:
-            client.messages.create(body=auto_reply_template(lang), from_=WHATSAPP_FROM, to=from_num)
-        except Exception as e:
-            print('Send error', e)
+        send_whatsapp(from_num, auto_reply_template(lang))
         if media:
-            try:
-                client.messages.create(body=media_received_template(lang), from_=WHATSAPP_FROM, to=from_num)
-            except:
-                pass
+            send_whatsapp(from_num, media_received_template(lang))
         if urgent:
             save_task(from_num, body)
-            try:
-                client.messages.create(body=task_saved_template(lang), from_=WHATSAPP_FROM, to=from_num)
-            except:
-                pass
-        if body.lower().startswith(('hi','hello','hey','नमस्कार','हाय','हॅलो')) or 'how are' in body.lower():
-            try:
-                client.messages.create(body=chat_mode_template(lang), from_=WHATSAPP_FROM, to=from_num)
-            except:
-                pass
+            send_whatsapp(from_num, task_saved_template(lang))
+        low = body.lower()
+        if low.startswith(('hi','hello','hey','नमस्कार','हाय','हॅलो')) or 'how are' in low:
+            send_whatsapp(from_num, chat_mode_template(lang))
     else:
         summary = f"Message from {from_num}: {body[:300]}"
-        try:
-            client.messages.create(body=summary, from_=WHATSAPP_FROM, to=ADMIN_WHATSAPP)
-        except Exception as e:
-            print('Notify admin error', e)
+        send_whatsapp(ADMIN_WHATSAPP, summary)
+
     return ('', 200)
 
 @app.route('/voice-webhook', methods=['POST'])
@@ -194,22 +226,20 @@ def voice_webhook():
     call_status = request.values.get('CallStatus', '').lower()
     from_num = request.values.get('From')
     if from_num and not from_num.startswith('whatsapp:'):
-        caller_whatsapp = f'whatsapp:{from_num}'
+        caller_whatsapp = _normalize_whatsapp(from_num)
     else:
         caller_whatsapp = from_num
 
     if call_status in ('no-answer', 'busy', 'failed'):
         lang = get_user_language(caller_whatsapp) or detect_language('')
-        try:
-            client.messages.create(body=call_fallback_template(lang), from_=WHATSAPP_FROM, to=caller_whatsapp)
-            save_message(caller_whatsapp, WHATSAPP_FROM, f"Call fallback: {call_status}", None, 'in', urgent=1)
-        except Exception as e:
-            print('voice fallback send error', e)
+        send_whatsapp(caller_whatsapp, call_fallback_template(lang))
+        save_message(caller_whatsapp, WHATSAPP_FROM, f"Call fallback: {call_status}", None, 'in', urgent=1)
     return ('', 200)
 
 @app.route('/set_status', methods=['POST'])
 def set_status():
-    new_state = request.json.get('state')
+    payload = request.get_json(silent=True) or {}
+    new_state = payload.get('state')
     if new_state not in ('available','busy','sleeping'):
         return jsonify({'error':'invalid'}), 400
     set_availability(new_state)
@@ -221,24 +251,22 @@ def send_summary_to_admin():
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute('SELECT COUNT(*) FROM messages WHERE ts >= datetime("now", "-1 day")')
-    total = cur.fetchone()[0]
+    total_row = cur.fetchone()
+    total = total_row[0] if total_row else 0
     cur.execute('SELECT COUNT(*) FROM tasks WHERE status="open"')
     tasks_open = cur.fetchone()[0]
     cur.execute('SELECT from_num, COUNT(*) c FROM messages GROUP BY from_num ORDER BY c DESC LIMIT 5')
     top = cur.fetchall()
     top_lines = '\n'.join([f"{r[0]} ({r[1]})" for r in top])
     msg = f"Soham — you are now available.\nMessages last 24h: {total}\nOpen tasks: {tasks_open}\nTop contacts:\n{top_lines}"
-    try:
-        client.messages.create(body=msg, from_=WHATSAPP_FROM, to=ADMIN_WHATSAPP)
-    except Exception as e:
-        print('Summary send error', e)
+    send_whatsapp(ADMIN_WHATSAPP, msg)
     conn.close()
 
 @app.route('/health', methods=['GET'])
 def health():
     return "OK", 200
 
-# Ensure DB and availability file exist when the app starts (works under Gunicorn)
+# --- init on import ---
 init_db()
 if not os.path.exists(AVAILABILITY_FILE):
     set_availability('available')
@@ -246,14 +274,4 @@ if not os.path.exists(AVAILABILITY_FILE):
 print("Sakhii: DB initialized and availability ensured. Starting app...")
 
 if __name__ == '__main__':
-# Ensure DB and availability file exist when the app starts (works under Gunicorn)
-init_db()
-if not os.path.exists(AVAILABILITY_FILE):
-    set_availability('available')
-
-print("Sakhii: DB initialized and availability ensured. Starting app...")
-
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000))) b8fb3a3 (Init DB at import and ensure availability file on startup)
-
-
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
