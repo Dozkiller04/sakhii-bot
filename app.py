@@ -1,4 +1,4 @@
-﻿# app.py (fixed and improved)
+﻿# app.py (final version with always-reply toggle + summary)
 import os
 import sqlite3
 from flask import Flask, request, jsonify
@@ -9,25 +9,19 @@ import re
 # --- CONFIG ---
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN  = os.getenv('TWILIO_AUTH_TOKEN')
-WHATSAPP_FROM      = os.getenv('WHATSAPP_FROM')  # e.g. 'whatsapp:+1415xxxxxxx'
-ADMIN_WHATSAPP     = os.getenv('ADMIN_WHATSAPP') # 'whatsapp:+91...'
+WHATSAPP_FROM      = os.getenv('WHATSAPP_FROM')  
+ADMIN_WHATSAPP     = os.getenv('ADMIN_WHATSAPP')
 AVAILABILITY_FILE  = 'availability.txt'
 SAKHII_NAME = "Sakhii"
 
-# create Twilio client lazily
-_twilio_client = None
-def get_twilio_client():
-    global _twilio_client
-    if _twilio_client is None:
-        if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
-            print("Warning: Twilio credentials are missing. Bot will not send WhatsApp messages.")
-            return None
-        _twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    return _twilio_client
+# NEW: always auto-reply mode (ignore availability)
+AUTO_REPLY_ALWAYS = os.getenv('AUTO_REPLY_ALWAYS', 'false').lower() in ('1','true','yes')
 
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 app = Flask(__name__)
 DB = 'whatsapp_bot.db'
 
+# ------------------ DB INIT ------------------
 def init_db():
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
@@ -40,8 +34,10 @@ def init_db():
     conn.commit()
     conn.close()
 
-def _now_sql():
-    return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+def _normalize_whatsapp(num: str):
+    if num and not num.startswith("whatsapp:"):
+        return "whatsapp:" + num.lstrip("+")
+    return num
 
 def save_user_language(phone, lang, display_name=None):
     conn = sqlite3.connect(DB)
@@ -51,13 +47,11 @@ def save_user_language(phone, lang, display_name=None):
         cur.execute('UPDATE users SET preferred_lang=? WHERE phone=?', (lang, phone))
     else:
         cur.execute('INSERT INTO users (phone,display_name,preferred_lang,created_at) VALUES (?,?,?,?)',
-                    (phone, display_name or '', lang, _now_sql()))
+                    (phone, display_name or '', lang, datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
 
 def get_user_language(phone):
-    if not phone:
-        return None
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute('SELECT preferred_lang FROM users WHERE phone=?', (phone,))
@@ -69,7 +63,7 @@ def save_message(from_num, to_num, text, media, direction, urgent=0):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute('INSERT INTO messages (from_num,to_num,text,media,direction,ts,urgent) VALUES (?,?,?,?,?,?,?)',
-                (from_num or '', to_num or '', text or '', media or None, direction or '', _now_sql(), urgent))
+                (from_num,to_num,text,media,direction, datetime.utcnow().isoformat(), urgent))
     conn.commit()
     conn.close()
 
@@ -77,10 +71,11 @@ def save_task(phone, text):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute('INSERT INTO tasks (phone,text,created_at,status) VALUES (?,?,?,?)',
-                (phone or '', text or '', _now_sql(), 'open'))
+                (phone, text, datetime.utcnow().isoformat(), 'open'))
     conn.commit()
     conn.close()
 
+# ------------------ AVAILABILITY ------------------
 def get_availability():
     if not os.path.exists(AVAILABILITY_FILE):
         return 'available'
@@ -91,189 +86,178 @@ def set_availability(state):
     with open(AVAILABILITY_FILE,'w') as f:
         f.write(state)
 
+# ------------------ LANG DETECTION ------------------
 def detect_language(text):
     if not text:
         return 'en'
-    marathi_chars = sum(1 for c in text if '\u0900' <= c <= '\u097F')
-    english_chars = sum(1 for c in text if c.isalpha() and ('a' <= c.lower() <= 'z'))
-    if marathi_chars >= 3:
+    mar = sum(1 for c in text if '\u0900' <= c <= '\u097F')
+    eng = sum(1 for c in text if c.isalpha())
+    if mar >= 3:
         return 'mr'
-    elif english_chars >= 3:
+    if eng >= 3:
         return 'en'
-    else:
-        marathi_keywords = ['काय','कसे','हय','कधी','धन्यवाद','होय','नमस्कार','संगी']
-        txt_lower = text.lower()
-        for kw in marathi_keywords:
-            if kw in txt_lower:
-                return 'mr'
-        return 'en'
+    mr_kw = ['काय','कसे','हय','कधी','धन्यवाद','नमस्कार']
+    for k in mr_kw:
+        if k in text:
+            return 'mr'
+    return 'en'
 
+# ------------------ TEMPLATES ------------------
 def sakhi_intro(lang='en'):
-    if lang == 'mr':
-        return f"नमस्कार — मी {SAKHII_NAME}, सोहमची सहाय्यक."
-    return f"Hi — I’m {SAKHII_NAME}, Soham's assistant."
+    return "नमस्कार — मी सखी." if lang == 'mr' else "Hi — I’m Sakhii."
 
 def auto_reply_template(lang='en'):
     if lang == 'mr':
-        return (sakhi_intro('mr') + " सोहम सध्या उपलब्ध नाही (बिझी आहे किंवा विश्रांती घेत आहे). "
-                "मी लगेच मदत करू शकते, मेसेज नोंदवू शकते, किंवा काही तातडीचे असल्यास मार्क करू शकते. "
-                "तातडीसाठी 'URGENT' लिहा. सोहमसाठी मेसेज देण्यासाठी 'Tell Soham:' ने सुरू करा.")
-    return (sakhi_intro('en') + " Soham is currently unavailable. I can help with quick questions, take notes, or mark something as urgent for him. "
-            "If it’s urgent, reply with 'URGENT'. To leave a message for Soham, start with 'Tell Soham:'.")
+        return (sakhi_intro('mr') +
+                " सोहम सध्या उपलब्ध नाही. मी तुमची मदत करू शकते.")
+    return (sakhi_intro('en') +
+            " Soham is currently unavailable. I can assist you.")
 
 def task_saved_template(lang='en'):
-    if lang == 'mr':
-        return "लक्षात घेतले! हा मेसेज मी सोहमसाठी टास्क म्हणून सेव्ह केला आहे."
-    return "Noted! I’ve saved this as a task for Soham."
+    return "टास्क सेव्ह केला आहे." if lang == 'mr' else "Task saved."
 
 def media_received_template(lang='en'):
-    if lang == 'mr':
-        return "मी तुम्हाला पाठवलेले मीडिया सेव्ह केले आहे आणि सोहमला दाखवीन."
-    return "I’ve received the media and saved it for Soham."
+    return "मीडिया मिळाला." if lang == 'mr' else "Media received."
 
 def chat_mode_template(lang='en'):
-    if lang == 'mr':
-        return "मी सखी. सोहम उपलब्ध नसताना मी तुम्हाला मदत करू शकते. सांगू का, तुम्हाला काय हवं आहे?"
-    return "I’m Sakhii. I can assist you while Soham is unavailable. What would you like to do?"
+    return "काय मदत करू?" if lang == 'mr' else "How can I help?"
 
 def call_fallback_template(lang='en'):
-    if lang == 'mr':
-        return (sakhi_intro('mr') + " सोहमला हा कॉल आला होता पण तो घेऊ शकला नाही. "
-                "तुम्हाला पुढे काय करायचं आहे?\n1) व्हॉईस मेसेज (REPLY: VOICE)\n2) टेक्स्ट नोट (REPLY: TEXT)\n3) कॉलबॅक (REPLY: CALLBACK)")
-    return (sakhi_intro('en') + " Soham received a call from this number but couldn’t pick up. You may:\n"
-            "1) Send a voice message (reply VOICE)\n2) Send a text note (reply TEXT)\n3) Request a callback (reply CALLBACK)")
+    return "Call missed." if lang == 'mr' else "Missed call noted."
 
 def detect_task(text):
     if not text:
         return False
-    text_l = text.lower()
-    triggers = ['tell soham', 'tell him', 'tell soham to', 'important', 'urgent', 'please inform', 'please tell']
-    for t in triggers:
-        if t in text_l:
-            return True
-    if re.search(r'\b(call|meeting|interview|urgent)\b', text_l):
-        return True
-    return False
+    t = text.lower()
+    triggers = ['tell soham', 'urgent', 'important']
+    return any(k in t for k in triggers)
 
-def _normalize_whatsapp(num):
-    if not num:
-        return None
-    if num.startswith('whatsapp:'):
-        return num
-    num = num.strip()
-    if num.startswith('+'):
-        return f'whatsapp:{num}'
-    return f'whatsapp:{num}'
-
-def send_whatsapp(to, body):
-    to = _normalize_whatsapp(to)
-    from_ = WHATSAPP_FROM
-    if not to or not from_:
-        print("send_whatsapp: missing 'to' or WHATSAPP_FROM'")
-        return None
-    client = get_twilio_client()
-    if client is None:
-        return None
+# ------------------ SAFE SEND ------------------
+def send_whatsapp(to_num, text):
     try:
-        return client.messages.create(body=body, from_=from_, to=to)
+        client.messages.create(body=text, from_=WHATSAPP_FROM, to=to_num)
     except Exception as e:
         print("Twilio send error:", e)
-        return None
 
+# ------------------ SUMMARY ------------------
+def build_sender_summary(phone):
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+
+    cur.execute("SELECT text FROM messages WHERE from_num=? ORDER BY ts DESC LIMIT 3", (phone,))
+    recent = cur.fetchall()
+
+    cur.execute("SELECT text FROM tasks WHERE phone=? AND status='open' ORDER BY created_at DESC LIMIT 5", (phone,))
+    tasks = cur.fetchall()
+
+    conn.close()
+
+    lines = []
+    if recent:
+        lines.append("Recent messages:")
+        for r in recent:
+            lines.append(f"- {r[0][:120]}")
+
+    if tasks:
+        lines.append("Open tasks:")
+        for r in tasks:
+            lines.append(f"- {r[0][:120]}")
+
+    return "\n".join(lines)
+
+# ------------------ MAIN WEBHOOK ------------------
 @app.route('/webhook', methods=['POST'])
 def webhook():
+
     from_num = request.values.get('From')
-    to_num = request.values.get('To')
-    body = request.values.get('Body', '').strip()
+    to_num   = request.values.get('To')
+    body     = request.values.get('Body', '').strip()
+
+    # normalize
+    from_num = _normalize_whatsapp(from_num)
+
+    # language
+    lang = get_user_language(from_num) or detect_language(body)
+    save_user_language(from_num, lang)
+
+    # media
     num_media = int(request.values.get('NumMedia', '0'))
     media_urls = []
     for i in range(num_media):
-        m = request.values.get(f'MediaUrl{i}')
+        m = request.values.get(f"MediaUrl{i}")
         if m:
             media_urls.append(m)
-    media = ','.join(media_urls) if media_urls else None
-
-    if from_num and not from_num.startswith('whatsapp:'):
-        from_num = _normalize_whatsapp(from_num)
-
-    lang = get_user_language(from_num)
-    if not lang:
-        lang = detect_language(body)
-        save_user_language(from_num, lang)
+    media = ",".join(media_urls) if media_urls else None
 
     urgent = 1 if detect_task(body) else 0
     save_message(from_num, to_num, body, media, 'in', urgent)
 
     state = get_availability()
-    if state != 'available':
-        send_whatsapp(from_num, auto_reply_template(lang))
+    should_reply = AUTO_REPLY_ALWAYS or (state != 'available')
+
+    if should_reply:
+        reply = auto_reply_template(lang)
+        summary = build_sender_summary(from_num)
+        if summary:
+            reply += "\n\n" + summary
+
+        send_whatsapp(from_num, reply)
+
         if media:
             send_whatsapp(from_num, media_received_template(lang))
+
         if urgent:
             save_task(from_num, body)
             send_whatsapp(from_num, task_saved_template(lang))
-        low = body.lower()
-        if low.startswith(('hi','hello','hey','नमस्कार','हाय','हॅलो')) or 'how are' in low:
+
+        if body.lower().startswith(("hi","hello","hey","नमस्कार")):
             send_whatsapp(from_num, chat_mode_template(lang))
+
     else:
-        summary = f"Message from {from_num}: {body[:300]}"
-        send_whatsapp(ADMIN_WHATSAPP, summary)
+        admin_msg = f"Message from {from_num}: {body[:300]}"
+        send_whatsapp(ADMIN_WHATSAPP, admin_msg)
 
     return ('', 200)
 
+
+# ------------------ VOICE FALLBACK ------------------
 @app.route('/voice-webhook', methods=['POST'])
 def voice_webhook():
     call_status = request.values.get('CallStatus', '').lower()
-    from_num = request.values.get('From')
-    if from_num and not from_num.startswith('whatsapp:'):
-        caller_whatsapp = _normalize_whatsapp(from_num)
-    else:
-        caller_whatsapp = from_num
+    from_num = _normalize_whatsapp(request.values.get('From'))
 
     if call_status in ('no-answer', 'busy', 'failed'):
-        lang = get_user_language(caller_whatsapp) or detect_language('')
-        send_whatsapp(caller_whatsapp, call_fallback_template(lang))
-        save_message(caller_whatsapp, WHATSAPP_FROM, f"Call fallback: {call_status}", None, 'in', urgent=1)
+        save_message(from_num, WHATSAPP_FROM, "Missed call", None, 'in', urgent=1)
+        send_whatsapp(from_num, call_fallback_template('en'))
     return ('', 200)
 
+# ------------------ STATUS SETTER ------------------
 @app.route('/set_status', methods=['POST'])
 def set_status():
-    # Accept JSON or form-encoded bodies (PowerShell/curl friendliness)
     payload = request.get_json(silent=True)
     new_state = None
-    if payload and isinstance(payload, dict):
-        new_state = payload.get('state')
-    # Fallback to form data or query params
-    if not new_state:
-        new_state = request.form.get('state') or request.values.get('state')
-    if not new_state or new_state not in ('available','busy','sleeping'):
-        return jsonify({'error':'invalid'}), 400
+
+    if payload and 'state' in payload:
+        new_state = payload['state']
+    else:
+        new_state = (
+            request.form.get('state') or
+            request.values.get('state')
+        )
+
+    if new_state not in ('available', 'busy', 'sleeping'):
+        return jsonify({'error': 'invalid'}), 400
+
     set_availability(new_state)
-    if new_state == 'available':
-        send_summary_to_admin()
-    return jsonify({'ok':True})
 
+    return jsonify({'ok': True})
 
-def send_summary_to_admin():
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('SELECT COUNT(*) FROM messages WHERE ts >= datetime("now", "-1 day")')
-    total_row = cur.fetchone()
-    total = total_row[0] if total_row else 0
-    cur.execute('SELECT COUNT(*) FROM tasks WHERE status="open"')
-    tasks_open = cur.fetchone()[0]
-    cur.execute('SELECT from_num, COUNT(*) c FROM messages GROUP BY from_num ORDER BY c DESC LIMIT 5')
-    top = cur.fetchall()
-    top_lines = '\n'.join([f"{r[0]} ({r[1]})" for r in top])
-    msg = f"Soham — you are now available.\nMessages last 24h: {total}\nOpen tasks: {tasks_open}\nTop contacts:\n{top_lines}"
-    send_whatsapp(ADMIN_WHATSAPP, msg)
-    conn.close()
-
-@app.route('/health', methods=['GET'])
+# ------------------ HEALTH ------------------
+@app.route('/health')
 def health():
     return "OK", 200
 
-# --- init on import ---
+# ------------------ APP STARTUP ------------------
 init_db()
 if not os.path.exists(AVAILABILITY_FILE):
     set_availability('available')
